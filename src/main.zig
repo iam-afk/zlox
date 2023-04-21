@@ -388,3 +388,55 @@ test "a (not very) pretty printer" {
 
     try std.testing.expectEqualSlices(u8, "(* (- 123) (group 45.67))", fbs.getWritten());
 }
+
+fn convertToRpn(writer: anytype, name: []const u8, exprs: anytype) !void {
+    const fields_info = @typeInfo(@TypeOf(exprs)).Struct.fields;
+    inline for (fields_info) |field_info| {
+        try printRpn(writer, @field(exprs, field_info.name));
+        try std.fmt.format(writer, " ", .{});
+    }
+    try std.fmt.format(writer, "{s}", .{name});
+}
+
+fn printRpn(writer: anytype, expr: *Expression) anyerror!void {
+    try switch (expr.*) {
+        .binary => |binary| convertToRpn(writer, binary.operator.lexeme, .{ binary.left, binary.right }),
+        .grouping => |grouping| printRpn(writer, grouping.expression),
+        .literal => |literal| switch (literal) {
+            .string => |value| std.fmt.format(writer, "{s}", .{value}),
+            .number => |value| std.fmt.format(writer, "{d}", .{value}),
+        },
+        .unary => |unary| convertToRpn(writer, unary.operator.lexeme, .{unary.right}),
+    };
+}
+
+test "reverse Polish notation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const b = Expression.builder(arena.allocator());
+
+    const expression = try b.binary(
+        try b.grouping(
+            try b.binary(
+                try b.literalNumber(1),
+                Token{ .type = .plus, .lexeme = "+", .line = 1 },
+                try b.literalNumber(2),
+            ),
+        ),
+        Token{ .type = .star, .lexeme = "*", .line = 1 },
+        try b.grouping(
+            try b.binary(
+                try b.literalNumber(4),
+                Token{ .type = .minus, .lexeme = "-", .line = 1 },
+                try b.literalNumber(3),
+            ),
+        ),
+    );
+
+    var buf: [32]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(buf[0..]);
+    try printRpn(fbs.writer(), expression);
+
+    try std.testing.expectEqualSlices(u8, "1 2 + 4 3 - *", fbs.getWritten());
+}
