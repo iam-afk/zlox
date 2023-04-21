@@ -286,14 +286,14 @@ const Scanner = struct {
     }
 };
 
-const Expression = union(enum) {
+const Expr = union(enum) {
     binary: struct {
-        left: *Expression,
+        left: *Expr,
         operator: Token,
-        right: *Expression,
+        right: *Expr,
     },
     grouping: struct {
-        expression: *Expression,
+        expression: *Expr,
     },
     literal: union(enum) {
         string: []const u8,
@@ -301,46 +301,14 @@ const Expression = union(enum) {
     },
     unary: struct {
         operator: Token,
-        right: *Expression,
+        right: *Expr,
     },
 
-    fn builder(allocator: Allocator) Builder {
-        return Builder{ .allocator = allocator };
+    fn create(allocator: Allocator, expr: anytype) !*Expr {
+        const e = try allocator.create(Expr);
+        e.* = expr;
+        return e;
     }
-
-    const Builder = struct {
-        allocator: Allocator,
-
-        fn binary(self: Builder, left: *Expression, operator: Token, right: *Expression) !*Expression {
-            var b = try self.allocator.create(Expression);
-            b.* = Expression{ .binary = .{ .left = left, .operator = operator, .right = right } };
-            return b;
-        }
-
-        fn grouping(self: Builder, expression: *Expression) !*Expression {
-            var g = try self.allocator.create(Expression);
-            g.* = Expression{ .grouping = .{ .expression = expression } };
-            return g;
-        }
-
-        fn literalString(self: Builder, value: []const u8) !*Expression {
-            var l = try self.allocator.create(Expression);
-            l.* = Expression{ .literal = .{ .string = value } };
-            return l;
-        }
-
-        fn literalNumber(self: Builder, value: f64) !*Expression {
-            var l = try self.allocator.create(Expression);
-            l.* = Expression{ .literal = .{ .number = value } };
-            return l;
-        }
-
-        fn unary(self: Builder, operator: Token, right: *Expression) !*Expression {
-            var u = try self.allocator.create(Expression);
-            u.* = Expression{ .unary = .{ .operator = operator, .right = right } };
-            return u;
-        }
-    };
 };
 
 fn parenthesize(writer: anytype, name: []const u8, exprs: anytype) !void {
@@ -353,7 +321,7 @@ fn parenthesize(writer: anytype, name: []const u8, exprs: anytype) !void {
     try std.fmt.format(writer, ")", .{});
 }
 
-fn printAst(writer: anytype, expr: *Expression) anyerror!void {
+fn printAst(writer: anytype, expr: *Expr) anyerror!void {
     try switch (expr.*) {
         .binary => |binary| parenthesize(writer, binary.operator.lexeme, .{ binary.left, binary.right }),
         .grouping => |grouping| parenthesize(writer, "group", .{grouping.expression}),
@@ -369,22 +337,22 @@ test "a (not very) pretty printer" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const b = Expression.builder(arena.allocator());
+    const a = arena.allocator();
 
-    const expression = try b.binary(
-        try b.unary(
-            Token{ .type = .minus, .lexeme = "-", .line = 1 },
-            try b.literalNumber(123),
-        ),
-        Token{ .type = .star, .lexeme = "*", .line = 1 },
-        try b.grouping(
-            try b.literalNumber(45.67),
-        ),
-    );
+    const expr = try Expr.create(a, .{ .binary = .{
+        .left = try Expr.create(a, .{ .unary = .{
+            .operator = Token{ .type = .minus, .lexeme = "-", .line = 1 },
+            .right = try Expr.create(a, .{ .literal = .{ .number = 123 } }),
+        } }),
+        .operator = Token{ .type = .star, .lexeme = "*", .line = 1 },
+        .right = try Expr.create(a, .{ .grouping = .{
+            .expression = try Expr.create(a, .{ .literal = .{ .number = 45.67 } }),
+        } }),
+    } });
 
     var buf: [32]u8 = undefined;
     var fbs = std.io.fixedBufferStream(buf[0..]);
-    try printAst(fbs.writer(), expression);
+    try printAst(fbs.writer(), expr);
 
     try std.testing.expectEqualSlices(u8, "(* (- 123) (group 45.67))", fbs.getWritten());
 }
@@ -398,7 +366,7 @@ fn convertToRpn(writer: anytype, name: []const u8, exprs: anytype) !void {
     try std.fmt.format(writer, "{s}", .{name});
 }
 
-fn printRpn(writer: anytype, expr: *Expression) anyerror!void {
+fn printRpn(writer: anytype, expr: *Expr) anyerror!void {
     try switch (expr.*) {
         .binary => |binary| convertToRpn(writer, binary.operator.lexeme, .{ binary.left, binary.right }),
         .grouping => |grouping| printRpn(writer, grouping.expression),
@@ -414,29 +382,29 @@ test "reverse Polish notation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const b = Expression.builder(arena.allocator());
+    const a = arena.allocator();
 
-    const expression = try b.binary(
-        try b.grouping(
-            try b.binary(
-                try b.literalNumber(1),
-                Token{ .type = .plus, .lexeme = "+", .line = 1 },
-                try b.literalNumber(2),
-            ),
-        ),
-        Token{ .type = .star, .lexeme = "*", .line = 1 },
-        try b.grouping(
-            try b.binary(
-                try b.literalNumber(4),
-                Token{ .type = .minus, .lexeme = "-", .line = 1 },
-                try b.literalNumber(3),
-            ),
-        ),
-    );
+    const expr = try Expr.create(a, .{ .binary = .{
+        .left = try Expr.create(a, .{ .grouping = .{
+            .expression = try Expr.create(a, .{ .binary = .{
+                .left = try Expr.create(a, .{ .literal = .{ .number = 1 } }),
+                .operator = Token{ .type = .plus, .lexeme = "+", .line = 1 },
+                .right = try Expr.create(a, .{ .literal = .{ .number = 2 } }),
+            } }),
+        } }),
+        .operator = Token{ .type = .star, .lexeme = "*", .line = 1 },
+        .right = try Expr.create(a, .{ .grouping = .{
+            .expression = try Expr.create(a, .{ .binary = .{
+                .left = try Expr.create(a, .{ .literal = .{ .number = 4 } }),
+                .operator = Token{ .type = .minus, .lexeme = "-", .line = 1 },
+                .right = try Expr.create(a, .{ .literal = .{ .number = 3 } }),
+            } }),
+        } }),
+    } });
 
     var buf: [32]u8 = undefined;
     var fbs = std.io.fixedBufferStream(buf[0..]);
-    try printRpn(fbs.writer(), expression);
+    try printRpn(fbs.writer(), expr);
 
     try std.testing.expectEqualSlices(u8, "1 2 + 4 3 - *", fbs.getWritten());
 }
