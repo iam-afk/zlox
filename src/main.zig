@@ -285,3 +285,106 @@ const Scanner = struct {
         });
     }
 };
+
+const Expression = union(enum) {
+    binary: struct {
+        left: *Expression,
+        operator: Token,
+        right: *Expression,
+    },
+    grouping: struct {
+        expression: *Expression,
+    },
+    literal: union(enum) {
+        string: []const u8,
+        number: f64,
+    },
+    unary: struct {
+        operator: Token,
+        right: *Expression,
+    },
+
+    fn builder(allocator: Allocator) Builder {
+        return Builder{ .allocator = allocator };
+    }
+
+    const Builder = struct {
+        allocator: Allocator,
+
+        fn binary(self: Builder, left: *Expression, operator: Token, right: *Expression) !*Expression {
+            var b = try self.allocator.create(Expression);
+            b.* = Expression{ .binary = .{ .left = left, .operator = operator, .right = right } };
+            return b;
+        }
+
+        fn grouping(self: Builder, expression: *Expression) !*Expression {
+            var g = try self.allocator.create(Expression);
+            g.* = Expression{ .grouping = .{ .expression = expression } };
+            return g;
+        }
+
+        fn literalString(self: Builder, value: []const u8) !*Expression {
+            var l = try self.allocator.create(Expression);
+            l.* = Expression{ .literal = .{ .string = value } };
+            return l;
+        }
+
+        fn literalNumber(self: Builder, value: f64) !*Expression {
+            var l = try self.allocator.create(Expression);
+            l.* = Expression{ .literal = .{ .number = value } };
+            return l;
+        }
+
+        fn unary(self: Builder, operator: Token, right: *Expression) !*Expression {
+            var u = try self.allocator.create(Expression);
+            u.* = Expression{ .unary = .{ .operator = operator, .right = right } };
+            return u;
+        }
+    };
+};
+
+fn parenthesize(writer: anytype, name: []const u8, exprs: anytype) !void {
+    try std.fmt.format(writer, "({s}", .{name});
+    const fields_info = @typeInfo(@TypeOf(exprs)).Struct.fields;
+    inline for (fields_info) |field_info| {
+        try std.fmt.format(writer, " ", .{});
+        try printAst(writer, @field(exprs, field_info.name));
+    }
+    try std.fmt.format(writer, ")", .{});
+}
+
+fn printAst(writer: anytype, expr: *Expression) anyerror!void {
+    try switch (expr.*) {
+        .binary => |binary| parenthesize(writer, binary.operator.lexeme, .{ binary.left, binary.right }),
+        .grouping => |grouping| parenthesize(writer, "group", .{grouping.expression}),
+        .literal => |literal| switch (literal) {
+            .string => |value| std.fmt.format(writer, "{s}", .{value}),
+            .number => |value| std.fmt.format(writer, "{d}", .{value}),
+        },
+        .unary => |unary| parenthesize(writer, unary.operator.lexeme, .{unary.right}),
+    };
+}
+
+test "a (not very) pretty printer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const b = Expression.builder(arena.allocator());
+
+    const expression = try b.binary(
+        try b.unary(
+            Token{ .type = .minus, .lexeme = "-", .line = 1 },
+            try b.literalNumber(123),
+        ),
+        Token{ .type = .star, .lexeme = "*", .line = 1 },
+        try b.grouping(
+            try b.literalNumber(45.67),
+        ),
+    );
+
+    var buf: [32]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(buf[0..]);
+    try printAst(fbs.writer(), expression);
+
+    try std.testing.expectEqualSlices(u8, "(* (- 123) (group 45.67))", fbs.getWritten());
+}
