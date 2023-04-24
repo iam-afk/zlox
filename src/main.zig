@@ -56,16 +56,26 @@ fn run(source: []const u8, writer: anytype, reporter: *ErrorReporter, allocator:
 
     try scanner.scanTokens();
 
-    for (scanner.tokens.items) |token| {
-        try writer.print("{}\n", .{token});
-    }
+    var parser = Parser.init(allocator, scanner.tokens.items, reporter);
+    const expression = parser.parse();
+
+    if (reporter.had_errors) return;
+
+    try printAst(writer, expression.?);
+    try writer.print("\n", .{});
 }
 
 const ErrorReporter = struct {
     had_errors: bool = false,
-    fn report(self: *ErrorReporter, line: i32, message: []const u8) void {
-        std.debug.print("[line {}] Error: {s}\n", .{ line, message });
+    fn report(self: *ErrorReporter, line: i32, where: ?Token, message: []const u8) void {
+        if (where) |token| switch (token.type) {
+            .eof => std.debug.print("[line {}] Error at end: {s}\n", .{ line, message }),
+            else => std.debug.print("[line {}] Error '{s}': {s}\n", .{ line, token.lexeme, message }),
+        } else std.debug.print("[line {}] Error: {s}\n", .{ line, message });
         self.had_errors = true;
+    }
+    fn reportToken(self: *ErrorReporter, token: Token, message: []const u8) void {
+        self.report(token.line, token, message);
     }
     fn reset(self: *ErrorReporter) void {
         self.had_errors = false;
@@ -73,6 +83,7 @@ const ErrorReporter = struct {
 };
 
 const Token = struct {
+    const TypeTag = std.meta.Tag(Type);
     const Type = union(enum) {
         left_paren,
         right_paren,
@@ -200,7 +211,7 @@ const Scanner = struct {
             '"' => try self.string(),
             '0'...'9' => try self.number(),
             'A'...'Z', 'a'...'z', '_' => try self.identifier(),
-            else => self.reporter.report(self.line, "Unexpected character."),
+            else => self.reporter.report(self.line, null, "Unexpected character."),
         }
     }
 
@@ -230,7 +241,7 @@ const Scanner = struct {
         }
 
         if (self.isAtEnd()) {
-            self.reporter.report(self.line, "Unterminated string.");
+            self.reporter.report(self.line, null, "Unterminated string.");
             return;
         }
 
@@ -298,13 +309,16 @@ const Expr = union(enum) {
     literal: union(enum) {
         string: []const u8,
         number: f64,
+        false,
+        true,
+        nil,
     },
     unary: struct {
         operator: Token,
         right: *Expr,
     },
 
-    fn create(allocator: Allocator, expr: anytype) !*Expr {
+    fn create(allocator: Allocator, expr: anytype) Allocator.Error!*Expr {
         const e = try allocator.create(Expr);
         e.* = expr;
         return e;
@@ -328,6 +342,9 @@ fn printAst(writer: anytype, expr: *Expr) anyerror!void {
         .literal => |literal| switch (literal) {
             .string => |value| std.fmt.format(writer, "{s}", .{value}),
             .number => |value| std.fmt.format(writer, "{d}", .{value}),
+            .false => std.fmt.format(writer, "false", .{}),
+            .true => std.fmt.format(writer, "true", .{}),
+            .nil => std.fmt.format(writer, "nil", .{}),
         },
         .unary => |unary| parenthesize(writer, unary.operator.lexeme, .{unary.right}),
     };
@@ -373,6 +390,9 @@ fn printRpn(writer: anytype, expr: *Expr) anyerror!void {
         .literal => |literal| switch (literal) {
             .string => |value| std.fmt.format(writer, "{s}", .{value}),
             .number => |value| std.fmt.format(writer, "{d}", .{value}),
+            .false => std.fmt.format(writer, "false", .{}),
+            .true => std.fmt.format(writer, "true", .{}),
+            .nil => std.fmt.format(writer, "nil", .{}),
         },
         .unary => |unary| convertToRpn(writer, unary.operator.lexeme, .{unary.right}),
     };
@@ -408,3 +428,160 @@ test "reverse Polish notation" {
 
     try std.testing.expectEqualSlices(u8, "1 2 + 4 3 - *", fbs.getWritten());
 }
+
+const Parser = struct {
+    allocator: Allocator,
+    tokens: []Token,
+    reporter: *ErrorReporter,
+    current: usize = 0,
+
+    const ParseError = error{Error} || Allocator.Error;
+
+    fn init(allocator: Allocator, tokens: []Token, reporter: *ErrorReporter) Parser {
+        return .{ .allocator = allocator, .tokens = tokens, .reporter = reporter };
+    }
+
+    fn parse(self: *Parser) ?*Expr {
+        return self.expression() catch null;
+    }
+
+    fn expression(self: *Parser) !*Expr {
+        return self.equality();
+    }
+
+    fn equality(self: *Parser) !*Expr {
+        var expr = try self.comparison();
+
+        while (self.match(.{ .bang_equal, .equal_equal })) {
+            const operator = self.previous();
+            const right = try self.comparison();
+            expr = try Expr.create(self.allocator, .{ .binary = .{ .left = expr, .operator = operator, .right = right } });
+        }
+
+        return expr;
+    }
+
+    fn comparison(self: *Parser) !*Expr {
+        var expr = try self.term();
+
+        while (self.match(.{ .greater, .greater_equal, .less, .less_equal })) {
+            const operator = self.previous();
+            const right = try self.term();
+            expr = try Expr.create(self.allocator, .{ .binary = .{ .left = expr, .operator = operator, .right = right } });
+        }
+
+        return expr;
+    }
+
+    fn term(self: *Parser) !*Expr {
+        var expr = try self.factor();
+
+        while (self.match(.{ .minus, .plus })) {
+            const operator = self.previous();
+            const right = try self.factor();
+            expr = try Expr.create(self.allocator, .{ .binary = .{ .left = expr, .operator = operator, .right = right } });
+        }
+
+        return expr;
+    }
+
+    fn factor(self: *Parser) !*Expr {
+        var expr = try self.unary();
+
+        while (self.match(.{ .slash, .star })) {
+            const operator = self.previous();
+            const right = try self.unary();
+            expr = try Expr.create(self.allocator, .{ .binary = .{ .left = expr, .operator = operator, .right = right } });
+        }
+
+        return expr;
+    }
+
+    fn unary(self: *Parser) !*Expr {
+        if (self.match(.{ .bang, .minus })) {
+            const operator = self.previous();
+            const right = try self.unary();
+            return try Expr.create(self.allocator, .{ .unary = .{ .operator = operator, .right = right } });
+        }
+
+        return self.primary();
+    }
+
+    fn primary(self: *Parser) ParseError!*Expr {
+        if (self.match(.{.False})) return try Expr.create(self.allocator, .{ .literal = .false });
+        if (self.match(.{.True})) return try Expr.create(self.allocator, .{ .literal = .true });
+        if (self.match(.{.Nil})) return try Expr.create(self.allocator, .{ .literal = .nil });
+
+        if (self.match(.{ .number, .string })) switch (self.previous().type) {
+            .number => |number| return try Expr.create(self.allocator, .{ .literal = .{ .number = number } }),
+            .string => |string| return try Expr.create(self.allocator, .{ .literal = .{ .string = string } }),
+            else => unreachable,
+        };
+
+        if (self.match(.{.left_paren})) {
+            const expr = try self.expression();
+            _ = try self.consume(.right_paren, "Expect ')' after expression.");
+            return try Expr.create(self.allocator, .{ .grouping = .{ .expression = expr } });
+        }
+
+        return self.report(self.peek(), "Expect expression.");
+    }
+
+    fn match(self: *Parser, types: anytype) bool {
+        const fields_info = @typeInfo(@TypeOf(types)).Struct.fields;
+        inline for (fields_info) |field_info| {
+            if (self.check(@field(types, field_info.name))) {
+                _ = self.advance();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn consume(self: *Parser, token_type: Token.Type, message: []const u8) ParseError!Token {
+        if (self.check(token_type)) return self.advance();
+        return self.report(self.peek(), message);
+    }
+
+    fn check(self: *Parser, token_type_tag: Token.TypeTag) bool {
+        if (self.isAtEnd()) return false;
+        return @as(Token.TypeTag, self.peek().type) == token_type_tag;
+    }
+
+    fn advance(self: *Parser) Token {
+        if (!self.isAtEnd()) self.current += 1;
+        return self.previous();
+    }
+
+    fn isAtEnd(self: *Parser) bool {
+        return self.peek().type == .eof;
+    }
+
+    fn peek(self: *Parser) Token {
+        return self.tokens[self.current];
+    }
+
+    fn previous(self: *Parser) Token {
+        return self.tokens[self.current - 1];
+    }
+
+    fn report(self: *Parser, token: Token, message: []const u8) ParseError {
+        self.reporter.reportToken(token, message);
+        return ParseError.Error;
+    }
+
+    fn synchronize(self: *Parser) void {
+        self.advance();
+
+        while (!self.isAtEnd()) {
+            if (self.previous().type == .semicolon) return;
+
+            switch (self.peek().type) {
+                .Class, .Fun, .Var, .For, .If, .While, .Print, .Return => return,
+                else => {},
+            }
+
+            self.advance();
+        }
+    }
+};
